@@ -7,7 +7,13 @@ from datetime import timedelta
 from dal.database import get_session
 from dal.models.users import User, UserCreate, UserPublic
 from core.config import settings
-from auth_service.security import get_password_hash, verify_password, create_access_token
+from dal.models.users import UserProfileRead, UserProfileUpdate
+from auth_service.security import (
+    get_password_hash,
+    verify_password,
+    create_access_token,
+    get_current_user,
+)
 
 router = APIRouter()
 
@@ -52,3 +58,25 @@ async def login(form_data: OAuth2PasswordRequestForm = Depends(), session: Async
         data={"sub": str(user.id), "role": user.role}, expires_delta=access_token_expires
     )
     return {"access_token": access_token, "token_type": "bearer"}
+
+@router.get("/profile", response_model=UserProfileRead)
+async def get_profile(
+    current_user: User = Depends(get_current_user),
+):
+    return current_user
+
+
+@router.put("/profile", response_model=UserProfileRead)
+async def update_profile(
+    profile_update: UserProfileUpdate,
+    current_user: User = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+):
+    for key, value in profile_update.model_dump(exclude_unset=True).items():
+        setattr(current_user, key, value)
+
+    session.add(current_user)
+    await session.commit()
+    await session.refresh(current_user)
+
+    return current_user

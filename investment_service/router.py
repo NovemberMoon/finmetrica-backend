@@ -14,6 +14,12 @@ from dal.models.invest import InvestmentRecommendation
 from auth_service.security import get_current_user
 from core.config import settings
 
+from datetime import date, datetime, time
+from dal.models.budget import BudgetLimit, FinancialGoal, Category
+from investment_service.ollama_client import ask_ollama
+from investment_service.prompt_builder import build_financial_prompt
+from investment_service.financial_analyzer import analyze_finances
+
 router = APIRouter()
 
 class RiskTestSubmit(BaseModel):
@@ -38,42 +44,166 @@ async def get_recommendation_history(current_user: User = Depends(get_current_us
     return history
 
 @router.get("/recommendation/generate")
-async def generate_ai_recommendation(current_user: User = Depends(get_current_user), session: AsyncSession = Depends(get_session)):
+async def generate_ai_recommendation(
+    force: bool = False,
+    current_user: User = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+):
     redis_client = redis.from_url(settings.REDIS_URL)
     cache_key = f"ai_rec_user_{current_user.id}"
+
     cached_rec = await redis_client.get(cache_key)
-    
-    if cached_rec:
+
+    if cached_rec and not force:
         await redis_client.aclose()
         return json.loads(cached_rec)
-    
-    acc_ids = (await session.exec(select(Account.id).where(Account.client_id == current_user.id))).all()
-    if not acc_ids:
+
+    today = date.today()
+    month_start = date(today.year, today.month, 1)
+
+    account_ids = (await session.exec(
+        select(Account.id).where(Account.client_id == current_user.id)
+    )).all()
+
+    if not account_ids:
         await redis_client.aclose()
         raise HTTPException(status_code=400, detail="Нет счетов для анализа")
 
-    income = (await session.exec(select(func.sum(Transaction.amount)).where(Transaction.account_id.in_(acc_ids), Transaction.type == TransactionType.INCOME))).first() or 0
-    expense = (await session.exec(select(func.sum(Transaction.amount)).where(Transaction.account_id.in_(acc_ids), Transaction.type == TransactionType.EXPENSE))).first() or 0
-    
-    surplus = (income - expense) / 100
-    prompt = f"У пользователя профицит: {surplus} руб. Риск-профиль: {current_user.risk_profile.value}. Дай инвест-совет."
-    
-    ai_text = ""
+    total_balance = (await session.exec(
+        select(func.coalesce(func.sum(Account.balance), 0)).where(
+            Account.client_id == current_user.id
+        )
+    )).one()
+
+    month_filter = [
+        Transaction.account_id.in_(account_ids),
+        Transaction.date >= datetime.combine(month_start, time.min),
+        Transaction.date <= datetime.combine(today, time.max),
+    ]
+
+    income = (await session.exec(
+        select(func.coalesce(func.sum(Transaction.amount), 0)).where(
+            *month_filter,
+            Transaction.type == TransactionType.INCOME,
+        )
+    )).one()
+
+    expense = (await session.exec(
+        select(func.coalesce(func.sum(Transaction.amount), 0)).where(
+            *month_filter,
+            Transaction.type == TransactionType.EXPENSE,
+        )
+    )).one()
+
+    surplus = income - expense
+
+    goals_raw = (await session.exec(
+        select(FinancialGoal).where(FinancialGoal.client_id == current_user.id)
+    )).all()
+
+    goals = [
+        {
+            "title": goal.title,
+            "target_amount": goal.target_amount,
+            "current_amount": goal.current_amount,
+            "progress_percent": round((goal.current_amount / goal.target_amount) * 100, 2)
+            if goal.target_amount else 0,
+        }
+        for goal in goals_raw
+    ]
+
+    limits_raw = (await session.exec(
+        select(BudgetLimit).where(BudgetLimit.client_id == current_user.id)
+    )).all()
+
+    limits = []
+
+    for limit in limits_raw:
+        spent = (await session.exec(
+            select(func.coalesce(func.sum(Transaction.amount), 0)).where(
+                Transaction.account_id.in_(account_ids),
+                Transaction.category_id == limit.category_id,
+                Transaction.type == TransactionType.EXPENSE,
+                Transaction.date >= datetime.combine(limit.start_date, time.min),
+                Transaction.date <= datetime.combine(limit.end_date, time.max),
+            )
+        )).one()
+
+        category = await session.get(Category, limit.category_id)
+
+        limits.append({
+            "category_name": category.name if category else "Без категории",
+            "amount_limit": limit.amount_limit,
+            "amount_spent": spent,
+        })
+
+    expenses_raw = (await session.exec(
+        select(Category.name, func.coalesce(func.sum(Transaction.amount), 0)).join(
+            Category,
+            Category.id == Transaction.category_id,
+            isouter=True,
+        ).where(
+            *month_filter,
+            Transaction.type == TransactionType.EXPENSE,
+        ).group_by(Category.name)
+    )).all()
+
+    expenses_by_category = [
+        {"category": row[0] or "Без категории", "total": row[1]}
+        for row in expenses_raw
+    ]
+
+    analysis = analyze_finances(
+        total_balance=total_balance,
+        income=income,
+        expense=expense,
+        surplus=surplus,
+        goals=goals,
+        limits=limits,
+        expenses_by_category=expenses_by_category,
+        risk_profile=current_user.risk_profile.value,
+        age=current_user.age,
+        employment_confidence=current_user.employment_confidence,
+        risk_tolerance=current_user.risk_tolerance,
+        investment_horizon=current_user.investment_horizon,
+        investment_experience=current_user.investment_experience,
+        income_stability=current_user.income_stability,
+        dependents_count=current_user.dependents_count,
+        has_emergency_fund=current_user.has_emergency_fund,
+        preferred_assets=current_user.preferred_assets,
+    )
+
+    prompt = build_financial_prompt(analysis)
+
     try:
-        async with httpx.AsyncClient() as client:
-            response = await client.post(settings.OLLAMA_URL, json={"model": "llama3", "prompt": prompt, "stream": False}, timeout=30.0)
-            response.raise_for_status()
-            ai_text = response.json().get("response", "Нет ответа от модели.")
+        ai_text = await ask_ollama(prompt)
     except Exception as e:
-        ai_text = f"ИИ временно недоступен. {str(e)}"
-        
-    recommendation = InvestmentRecommendation(client_id=current_user.id, surplus_amount=int(surplus*100), prompt_context=prompt, generated_text=ai_text)
+        ai_text = (
+            "ИИ временно недоступен. "
+            "Проверь, что Ollama запущена и модель llama3.2:3b установлена. "
+            f"Техническая ошибка: {str(e)}"
+        )
+
+    recommendation = InvestmentRecommendation(
+        client_id=current_user.id,
+        surplus_amount=surplus,
+        prompt_context=prompt,
+        generated_text=ai_text,
+    )
+
     session.add(recommendation)
     await session.commit()
     await session.refresh(recommendation)
-    
-    result_data = {"id": str(recommendation.id), "ai_text": ai_text, "surplus": surplus}
-    await redis_client.setex(cache_key, 3600, json.dumps(result_data))
+
+    result_data = {
+        "id": str(recommendation.id),
+        "ai_text": ai_text,
+        "surplus": surplus,
+        "model": settings.OLLAMA_MODEL,
+        "analysis": analysis,
+    }
+
+    await redis_client.setex(cache_key, 3600, json.dumps(result_data, ensure_ascii=False))
     await redis_client.aclose()
-    
+
     return result_data
